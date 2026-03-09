@@ -338,26 +338,50 @@ def get_dashboard_stats():
     }
 
 def update_card_progress(card_id, new_mastery_level):
+    """
+    根据用户自评结果更新某张卡片的掌握度和复习记录。
+    new_mastery_level 约定取值：
+        2 -> 已经烂熟于心（大幅降低推荐频率）
+        1 -> 继续考（正常复习，略有提升）
+        0 -> 完全没记起来（加大复习频率）
+    实际写入的 mastery_level 会在现有基础上做一定调整。
+    """
     conn = get_connection()
     c = conn.cursor()
-    
+
     from datetime import datetime
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    # Update mastery_level, last_reviewed_at, and increment review_count
-    # For mastery_level, we can take the new score directly as requested by the user
-    # Or maybe a simple weighted average: (old * count + new) / (count + 1)
-    # The user said: "Update mastery_level (can be weighted average or direct overwrite, keep it simple for now)"
-    # I will use direct overwrite as it's simplest and reflects latest performance
-    
-    c.execute('''
+
+    # 先取出当前 mastery_level
+    c.execute("SELECT mastery_level FROM cards WHERE id = ?", (card_id,))
+    row = c.fetchone()
+    old_mastery = row[0] if row and row[0] is not None else 0
+
+    # 根据用户自评结果调整掌握度
+    if new_mastery_level == 2:
+        # 已经烂熟于心：直接提升到 5
+        updated_mastery = 5
+    elif new_mastery_level == 1:
+        # 继续考：在原有基础上小幅提升
+        updated_mastery = min(5, old_mastery + 1)
+    elif new_mastery_level == 0:
+        # 完全没记起来：拉低掌握度，增加推荐频率
+        updated_mastery = max(0, min(old_mastery, 2) - 2) if old_mastery > 0 else 0
+    else:
+        # 未知取值，保持不变
+        updated_mastery = old_mastery
+
+    c.execute(
+        '''
         UPDATE cards 
         SET mastery_level = ?, 
             last_reviewed_at = ?, 
             review_count = review_count + 1 
         WHERE id = ?
-    ''', (new_mastery_level, current_time, card_id))
-    
+        ''',
+        (updated_mastery, current_time, card_id),
+    )
+
     conn.commit()
     conn.close()
 

@@ -1,6 +1,8 @@
 import streamlit as st
 from db import init_db, add_subject, get_all_subjects, add_cards, get_card_for_review, update_card_progress, get_recommended_cards, get_dashboard_stats, get_top_priority_cards
-from extractor import read_pdf, extract_knowledge, evaluate_answer
+from extractor import read_document, extract_knowledge
+
+## /*streamlit run app.py*/
 
 # Initialize database
 init_db()
@@ -53,16 +55,12 @@ elif page == "开始复习":
     # Initialize session state for review
     if 'current_card' not in st.session_state:
         st.session_state.current_card = get_recommended_cards()
-        st.session_state.review_submitted = False
-        st.session_state.user_answer = ""
-        st.session_state.evaluation = None
+        st.session_state.show_answer = False
 
     # Function to load next card
     def load_next_card():
         st.session_state.current_card = get_recommended_cards()
-        st.session_state.review_submitted = False
-        st.session_state.user_answer = ""
-        st.session_state.evaluation = None
+        st.session_state.show_answer = False
 
     if st.session_state.current_card:
         card = st.session_state.current_card
@@ -71,41 +69,41 @@ elif page == "开始复习":
         if 'reason' in card:
              st.caption(f"💡 推荐理由：{card['reason']}")
 
-        st.subheader("问题")
+        st.subheader("填空题")
         st.markdown(f"### {card['question']}")
-        
-        if not st.session_state.review_submitted:
-             user_answer = st.text_area("你的回答", height=150, key="answer_input")
-             
-             if st.button("提交回答"):
-                if user_answer.strip():
-                    st.session_state.user_answer = user_answer
-                    with st.spinner("AI 正在判卷..."):
-                        evaluation = evaluate_answer(card['question'], card['answer'], user_answer)
-                        st.session_state.evaluation = evaluation
-                        st.session_state.review_submitted = True
-                        
-                        # Update database
-                        update_card_progress(card['id'], evaluation['score'])
-                        st.rerun()
-                else:
-                    st.warning("请输入回答内容")
-        
+
+        # 第一步：用户在心里回忆答案，不需要输入
+        if not st.session_state.show_answer:
+            st.info("请先在心里回忆被挖空的内容，然后点击下方按钮查看答案。")
+            if st.button("完成，查看答案"):
+                st.session_state.show_answer = True
+                st.rerun()
+
         else:
-            st.text_area("你的回答", value=st.session_state.user_answer, height=150, disabled=True)
-            # Show evaluation results
+            # 展示答案
             st.divider()
-            evaluation = st.session_state.evaluation
-            
-            col1, col2 = st.columns([1, 3])
+            st.success(f"**答案**：{card['answer']}")
+
+            st.write("请根据你的真实掌握情况选择一个评价：")
+            col1, col2, col3 = st.columns(3)
             with col1:
-                st.metric("得分", f"{evaluation['score']} / 5")
+               熟_button = st.button("已经烂熟于心")
             with col2:
-                st.info(f"**AI 评价**：{evaluation['feedback']}")
-            
-            st.success(f"**标准答案**：\n\n{card['answer']}")
-            
-            if st.button("下一题"):
+               继续_button = st.button("继续考")
+            with col3:
+               不会_button = st.button("完全没记起来")
+
+            # 根据用户自评结果更新掌握度
+            if 熟_button:
+                update_card_progress(card['id'], 2)
+                load_next_card()
+                st.rerun()
+            elif 继续_button:
+                update_card_progress(card['id'], 1)
+                load_next_card()
+                st.rerun()
+            elif 不会_button:
+                update_card_progress(card['id'], 0)
                 load_next_card()
                 st.rerun()
             
@@ -156,15 +154,15 @@ elif page == "导入知识":
             format_func=lambda x: subject_options[x]
         )
         
-        uploaded_file = st.file_uploader("上传 PDF 文件", type=["pdf"])
+        uploaded_file = st.file_uploader("上传文档（支持 PDF / Markdown）", type=["pdf", "md", "markdown"])
         
         if uploaded_file is not None:
             if st.button("开始分析"):
                 with st.spinner("正在读取 PDF 并提取知识点，请稍候..."):
                     try:
-                        # 读取 PDF 内容
-                        text = read_pdf(uploaded_file)
-                        st.info(f"成功读取 PDF，文本长度：{len(text)} 字符")
+                        # 读取文档内容（PDF / Markdown）
+                        text = read_document(uploaded_file)
+                        st.info(f"成功读取文档，文本长度：{len(text)} 字符")
                         
                         # 提取知识点
                         knowledge_points = extract_knowledge(text)
