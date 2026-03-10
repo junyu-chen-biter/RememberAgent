@@ -24,7 +24,8 @@ def init_db():
     ''')
     
     # Create cards table
-    # cards: id (PK), subject_id (FK), question, answer, created_at, last_reviewed_at, review_count, mastery_level (0-5)
+    # cards: id (PK), subject_id (FK), question, answer, created_at, last_reviewed_at,
+    #        review_count, mastery_level (0-5), ignored (0/1, whether this card should be skipped entirely)
     c.execute('''
         CREATE TABLE IF NOT EXISTS cards (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,9 +36,18 @@ def init_db():
             last_reviewed_at TEXT,
             review_count INTEGER DEFAULT 0,
             mastery_level INTEGER DEFAULT 0,
+            ignored INTEGER DEFAULT 0,
             FOREIGN KEY (subject_id) REFERENCES subjects (id)
         )
     ''')
+
+    # Backward-compatible migration: ensure existing cards table has the 'ignored' column.
+    # SQLite prior to 3.35 does not support IF NOT EXISTS on ADD COLUMN, so we need to
+    # detect the column first.
+    c.execute("PRAGMA table_info(cards)")
+    existing_columns = [row[1] for row in c.fetchall()]
+    if "ignored" not in existing_columns:
+        c.execute("ALTER TABLE cards ADD COLUMN ignored INTEGER DEFAULT 0")
     
     conn.commit()
     conn.close()
@@ -69,8 +79,8 @@ def add_cards(subject_id, qa_list):
     ]
     
     c.executemany('''
-        INSERT INTO cards (subject_id, question, answer, created_at, last_reviewed_at, review_count, mastery_level)
-        VALUES (?, ?, ?, ?, ?, 0, 0)
+        INSERT INTO cards (subject_id, question, answer, created_at, last_reviewed_at, review_count, mastery_level, ignored)
+        VALUES (?, ?, ?, ?, ?, 0, 0, 0)
     ''', data_to_insert)
     
     conn.commit()
@@ -79,8 +89,8 @@ def add_cards(subject_id, qa_list):
 def get_card_for_review():
     conn = get_connection()
     c = conn.cursor()
-    # Randomly select one card where mastery_level < 5
-    c.execute('SELECT * FROM cards WHERE mastery_level < 5 ORDER BY RANDOM() LIMIT 1')
+    # Randomly select one card where mastery_level < 5 and not ignored
+    c.execute('SELECT * FROM cards WHERE mastery_level < 5 AND (ignored IS NULL OR ignored = 0) ORDER BY RANDOM() LIMIT 1')
     card = c.fetchone()
     conn.close()
     
@@ -111,6 +121,7 @@ def get_recommended_cards():
         FROM cards c
         JOIN subjects s ON c.subject_id = s.id
         WHERE c.mastery_level < 5
+          AND (c.ignored IS NULL OR c.ignored = 0)
     '''
     c.execute(query)
     cards = c.fetchall()
@@ -218,6 +229,7 @@ def get_top_priority_cards(limit=5):
         FROM cards c
         JOIN subjects s ON c.subject_id = s.id
         WHERE c.mastery_level < 5
+          AND (c.ignored IS NULL OR c.ignored = 0)
     '''
     c.execute(query)
     cards = c.fetchall()
@@ -292,13 +304,16 @@ def get_dashboard_stats():
     c = conn.cursor()
     
     # 1. Total cards
-    c.execute("SELECT COUNT(*) FROM cards")
+    c.execute("SELECT COUNT(*) FROM cards WHERE ignored IS NULL OR ignored = 0")
     total_cards = c.fetchone()[0]
     
     # 2. Today's reviews
     from datetime import datetime
     today_str = datetime.now().strftime("%Y-%m-%d")
-    c.execute("SELECT COUNT(*) FROM cards WHERE date(last_reviewed_at) = ?", (today_str,))
+    c.execute(
+        "SELECT COUNT(*) FROM cards WHERE date(last_reviewed_at) = ? AND (ignored IS NULL OR ignored = 0)",
+        (today_str,),
+    )
     today_reviews = c.fetchone()[0] # This counts unique cards reviewed today, if we want total attempts we need a separate log table, but this is fine for now
     
     # Actually, the requirement says "今日已复习次数". 
@@ -308,7 +323,7 @@ def get_dashboard_stats():
     # But for simple MVP, let's assume this means "Number of cards reviewed today".
     
     # 3. Overall Mastery (Average mastery_level)
-    c.execute("SELECT AVG(mastery_level) FROM cards")
+    c.execute("SELECT AVG(mastery_level) FROM cards WHERE ignored IS NULL OR ignored = 0")
     avg_mastery = c.fetchone()[0]
     avg_mastery = round(avg_mastery, 2) if avg_mastery else 0.0
     
@@ -318,7 +333,9 @@ def get_dashboard_stats():
     # Let's use: Average Mastery % per subject
     
     df = pd.read_sql_query('''
-        SELECT s.name, AVG(c.mastery_level) as avg_mastery, COUNT(c.id) as card_count
+        SELECT s.name,
+               AVG(CASE WHEN c.ignored IS NULL OR c.ignored = 0 THEN c.mastery_level END) as avg_mastery,
+               SUM(CASE WHEN c.ignored IS NULL OR c.ignored = 0 THEN 1 ELSE 0 END) as card_count
         FROM subjects s
         LEFT JOIN cards c ON s.id = c.subject_id
         GROUP BY s.id
@@ -352,34 +369,44 @@ def update_card_progress(card_id, new_mastery_level):
     from datetime import datetime
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # 先取出当前 mastery_level
-    c.execute("SELECT mastery_level FROM cards WHERE id = ?", (card_id,))
+    # 先取出当前 mastery_level 与 ignored 状态
+    c.execute("SELECT mastery_level, ignored FROM cards WHERE id = ?", (card_id,))
     row = c.fetchone()
     old_mastery = row[0] if row and row[0] is not None else 0
+    old_ignored = row[1] if row and len(row) > 1 and row[1] is not None else 0
 
     # 根据用户自评结果调整掌握度
-    if new_mastery_level == 2:
+    # 新增特殊取值：-1 表示「不用掌握」，直接标记为忽略，不再出现在后续题库和统计中
+    if new_mastery_level == -1:
+        updated_mastery = old_mastery  # 保留原有掌握度记录，仅改变 ignored 标志
+        new_ignored = 1
+    elif new_mastery_level == 2:
         # 已经烂熟于心：直接提升到 5
         updated_mastery = 5
+        new_ignored = 0
     elif new_mastery_level == 1:
         # 继续考：在原有基础上小幅提升
         updated_mastery = min(5, old_mastery + 1)
+        new_ignored = 0
     elif new_mastery_level == 0:
         # 完全没记起来：拉低掌握度，增加推荐频率
         updated_mastery = max(0, min(old_mastery, 2) - 2) if old_mastery > 0 else 0
+        new_ignored = 0
     else:
         # 未知取值，保持不变
         updated_mastery = old_mastery
+        new_ignored = old_ignored
 
     c.execute(
         '''
         UPDATE cards 
         SET mastery_level = ?, 
             last_reviewed_at = ?, 
-            review_count = review_count + 1 
+            review_count = review_count + 1,
+            ignored = ?
         WHERE id = ?
         ''',
-        (updated_mastery, current_time, card_id),
+        (updated_mastery, current_time, new_ignored, card_id),
     )
 
     conn.commit()

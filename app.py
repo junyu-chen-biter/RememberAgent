@@ -85,13 +85,15 @@ elif page == "开始复习":
             st.success(f"**答案**：{card['answer']}")
 
             st.write("请根据你的真实掌握情况选择一个评价：")
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             with col1:
                熟_button = st.button("已经烂熟于心")
             with col2:
                继续_button = st.button("继续考")
             with col3:
                不会_button = st.button("完全没记起来")
+            with col4:
+               不用掌握_button = st.button("不用掌握（以后不再出现）")
 
             # 根据用户自评结果更新掌握度
             if 熟_button:
@@ -104,6 +106,12 @@ elif page == "开始复习":
                 st.rerun()
             elif 不会_button:
                 update_card_progress(card['id'], 0)
+                load_next_card()
+                st.rerun()
+            elif 不用掌握_button:
+                # -1 约定为「不用掌握」，在后端会将该卡片标记为 ignored，
+                # 之后不会再出现在任何推荐、复习与统计中
+                update_card_progress(card['id'], -1)
                 load_next_card()
                 st.rerun()
             
