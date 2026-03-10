@@ -1,5 +1,5 @@
 import streamlit as st
-from db import init_db, add_subject, get_all_subjects, add_cards, get_card_for_review, update_card_progress, get_recommended_cards, get_dashboard_stats, get_top_priority_cards
+from db import init_db, add_subject, get_all_subjects, add_cards, add_imported_file, get_subject_imported_files, get_daily_recommendation_limit, get_today_recommendation_count, get_card_for_review, update_card_progress, get_recommended_cards, get_dashboard_stats, get_top_priority_cards
 from extractor import read_document, extract_knowledge
 
 ## /*streamlit run app.py*/
@@ -51,6 +51,7 @@ if page == "主页":
 
 elif page == "开始复习":
     st.title("开始复习")
+    st.caption(f"今日进度：{get_today_recommendation_count()} / {get_daily_recommendation_limit()}")
     
     # Initialize session state for review
     if 'current_card' not in st.session_state:
@@ -64,6 +65,11 @@ elif page == "开始复习":
 
     if st.session_state.current_card:
         card = st.session_state.current_card
+
+        if card.get("daily_limit_reached"):
+            st.success("今天的复习完成了。")
+            st.caption(f"今日已完成：{card['today_recommended_count']} / {card['daily_limit']}")
+            st.stop()
         
         # Display recommendation reason
         if 'reason' in card:
@@ -144,7 +150,15 @@ elif page == "学科设置":
     st.divider()
     st.subheader("已添加学科")
     subjects_df = get_all_subjects()
-    st.dataframe(subjects_df)
+    imported_files_df = get_subject_imported_files()
+    subjects_view_df = subjects_df.copy()
+    subjects_view_df['已添加知识点'] = ''
+
+    if not imported_files_df.empty:
+        file_map = dict(zip(imported_files_df['subject_id'], imported_files_df['imported_files']))
+        subjects_view_df['已添加知识点'] = subjects_view_df['id'].map(file_map).fillna('')
+
+    st.dataframe(subjects_view_df)
 
 elif page == "导入知识":
     st.title("导入知识")
@@ -178,8 +192,8 @@ elif page == "导入知识":
                         if knowledge_points:
                             st.success(f"成功提取 {len(knowledge_points)} 个知识点！")
                             
-                            # 插入数据库
                             add_cards(selected_subject_id, knowledge_points)
+                            add_imported_file(selected_subject_id, uploaded_file.name)
                             st.success("知识点已保存到数据库。")
                             
                             # 展示提取结果

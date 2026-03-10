@@ -3,6 +3,11 @@ import os
 import pandas as pd
 
 DB_NAME = "knowledge_agent.db"
+DAILY_RECOMMENDATION_LIMIT = 100  #  每日推荐卡片数量上限
+W_URGENCY = 100.0 # 紧急度权重
+W_IMPORTANCE = 5.0 # 重要度权重
+W_FORGET = 1.0 # 遗忘权重
+W_MASTERY = 6.0 # 掌握度权重
 
 def get_connection():
     return sqlite3.connect(DB_NAME)
@@ -38,6 +43,25 @@ def init_db():
             mastery_level INTEGER DEFAULT 0,
             ignored INTEGER DEFAULT 0,
             FOREIGN KEY (subject_id) REFERENCES subjects (id)
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS imported_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject_id INTEGER NOT NULL,
+            file_name TEXT NOT NULL,
+            imported_at TEXT NOT NULL,
+            FOREIGN KEY (subject_id) REFERENCES subjects (id)
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS recommendation_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            card_id INTEGER NOT NULL,
+            recommended_at TEXT NOT NULL,
+            FOREIGN KEY (card_id) REFERENCES cards (id)
         )
     ''')
 
@@ -86,6 +110,45 @@ def add_cards(subject_id, qa_list):
     conn.commit()
     conn.close()
 
+def add_imported_file(subject_id, file_name):
+    conn = get_connection()
+    c = conn.cursor()
+    from datetime import datetime
+    imported_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        'INSERT INTO imported_files (subject_id, file_name, imported_at) VALUES (?, ?, ?)',
+        (subject_id, file_name, imported_at),
+    )
+    conn.commit()
+    conn.close()
+
+def get_subject_imported_files():
+    conn = get_connection()
+    df = pd.read_sql_query('''
+        SELECT subject_id, GROUP_CONCAT(DISTINCT file_name) AS imported_files
+        FROM imported_files
+        GROUP BY subject_id
+    ''', conn)
+    conn.close()
+    return df
+
+def get_daily_recommendation_limit():
+    return DAILY_RECOMMENDATION_LIMIT
+
+def get_today_recommendation_count():
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute(
+        '''
+        SELECT COUNT(*)
+        FROM recommendation_logs
+        WHERE date(recommended_at) = date('now', 'localtime')
+        '''
+    )
+    count = c.fetchone()[0]
+    conn.close()
+    return count
+
 def get_card_for_review():
     conn = get_connection()
     c = conn.cursor()
@@ -112,6 +175,22 @@ def get_card_for_review():
 def get_recommended_cards():
     conn = get_connection()
     c = conn.cursor()
+
+    c.execute(
+        '''
+        SELECT COUNT(*)
+        FROM recommendation_logs
+        WHERE date(recommended_at) = date('now', 'localtime')
+        '''
+    )
+    today_recommended_count = c.fetchone()[0]
+    if today_recommended_count >= DAILY_RECOMMENDATION_LIMIT:
+        conn.close()
+        return {
+            "daily_limit_reached": True,
+            "daily_limit": DAILY_RECOMMENDATION_LIMIT,
+            "today_recommended_count": today_recommended_count
+        }
     
     # Fetch all cards with their subject details
     query = '''
@@ -122,6 +201,11 @@ def get_recommended_cards():
         JOIN subjects s ON c.subject_id = s.id
         WHERE c.mastery_level < 5
           AND (c.ignored IS NULL OR c.ignored = 0)
+          AND c.id NOT IN (
+              SELECT card_id
+              FROM recommendation_logs
+              WHERE date(recommended_at) = date('now', 'localtime')
+          )
     '''
     c.execute(query)
     cards = c.fetchall()
@@ -134,12 +218,6 @@ def get_recommended_cards():
     
     weighted_cards = []
     current_time = datetime.now()
-    
-    # Weights (customizable)
-    W_URGENCY = 100.0  # Increased weight to make DDL very significant
-    W_IMPORTANCE = 5.0
-    W_FORGET = 2.0
-    W_MASTERY = 3.0
     
     for card in cards:
         card_id, subject_id, question, answer, created_at, last_reviewed_at, review_count, mastery_level, ddl_str, credits, difficulty = card
@@ -214,11 +292,25 @@ def get_recommended_cards():
     weighted_cards.sort(key=lambda x: x['priority_score'], reverse=True)
     
     if weighted_cards:
-        return weighted_cards[0]
+        selected = weighted_cards[0]
+        conn = get_connection()
+        c = conn.cursor()
+        from datetime import datetime
+        recommended_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        c.execute(
+            'INSERT INTO recommendation_logs (card_id, recommended_at) VALUES (?, ?)',
+            (selected['id'], recommended_at),
+        )
+        conn.commit()
+        conn.close()
+        return selected
     return None
 
 def get_top_priority_cards(limit=5):
     # Reuses the logic from get_recommended_cards but returns top N
+    if get_today_recommendation_count() >= DAILY_RECOMMENDATION_LIMIT:
+        return []
+
     conn = get_connection()
     c = conn.cursor()
     
@@ -230,6 +322,11 @@ def get_top_priority_cards(limit=5):
         JOIN subjects s ON c.subject_id = s.id
         WHERE c.mastery_level < 5
           AND (c.ignored IS NULL OR c.ignored = 0)
+          AND c.id NOT IN (
+              SELECT card_id
+              FROM recommendation_logs
+              WHERE date(recommended_at) = date('now', 'localtime')
+          )
     '''
     c.execute(query)
     cards = c.fetchall()
@@ -242,11 +339,6 @@ def get_top_priority_cards(limit=5):
     
     weighted_cards = []
     current_time = datetime.now()
-    
-    W_URGENCY = 100.0
-    W_IMPORTANCE = 5.0
-    W_FORGET = 2.0
-    W_MASTERY = 3.0
     
     for card in cards:
         card_id, subject_id, question, answer, created_at, last_reviewed_at, review_count, mastery_level, ddl_str, credits, difficulty, subject_name = card
